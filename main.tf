@@ -1,60 +1,26 @@
+provider "aws" {
+  region = "us-east-1" # CloudFront expects resources in us-east-1 region only
+  alias  = "aws-us-east-1"
+
+  # Make it faster by skipping something
+  skip_metadata_api_check     = true
+  skip_region_validation      = true
+  skip_credentials_validation = true
+
+  # skip_requesting_account_id should be disabled to generate valid ARN in apigatewayv2_api_execution_arn
+  skip_requesting_account_id = false
+}
+
 locals {
-  create_origin_access_identity = var.create_origin_access_identity && length(keys(var.origin_access_identities)) > 0
-  create_origin_access_control  = var.create_origin_access_control && length(keys(var.origin_access_control)) > 0
-  create_vpc_origin             = var.create_vpc_origin && length(keys(var.vpc_origin)) > 0
-}
-
-resource "aws_cloudfront_origin_access_identity" "this" {
-  for_each = local.create_origin_access_identity ? var.origin_access_identities : {}
-
-  comment = each.value
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_cloudfront_origin_access_control" "this" {
-  for_each = local.create_origin_access_control ? var.origin_access_control : {}
-
-  name = try(each.value.name, null) != null ? each.value.name : each.key
-
-  description                       = each.value["description"]
-  origin_access_control_origin_type = each.value["origin_type"]
-  signing_behavior                  = each.value["signing_behavior"]
-  signing_protocol                  = each.value["signing_protocol"]
-}
-
-resource "aws_cloudfront_vpc_origin" "this" {
-  for_each = local.create_vpc_origin ? var.vpc_origin : {}
-
-  vpc_origin_endpoint_config {
-    name                   = each.value["name"]
-    arn                    = each.value["arn"]
-    http_port              = each.value["http_port"]
-    https_port             = each.value["https_port"]
-    origin_protocol_policy = each.value["origin_protocol_policy"]
-
-    origin_ssl_protocols {
-      items    = each.value.origin_ssl_protocols.items
-      quantity = each.value.origin_ssl_protocols.quantity
-    }
-  }
-
-  timeouts {
-    create = try(var.vpc_origin_timeouts.create, null)
-    update = try(var.vpc_origin_timeouts.update, null)
-    delete = try(var.vpc_origin_timeouts.delete, null)
-  }
-
-  tags = var.tags
+#  domain_name = var.domain_name
+#  subdomain   = var.subdomain
 }
 
 resource "aws_cloudfront_distribution" "this" {
   count = var.create_distribution ? 1 : 0
 
   aliases                         = var.aliases
-  comment                         = var.comment
+  comment                         = var.description != null ? var.description : var.cf_name
   continuous_deployment_policy_id = var.continuous_deployment_policy_id
   default_root_object             = var.default_root_object
   enabled                         = var.enabled
@@ -64,18 +30,18 @@ resource "aws_cloudfront_distribution" "this" {
   retain_on_delete                = var.retain_on_delete
   staging                         = var.staging
   wait_for_deployment             = var.wait_for_deployment
-  web_acl_id                      = var.web_acl_id
-  tags                            = var.tags
+  web_acl_id                      = ( var.attach_web_acl && length(var.web_acl_id ) > 0 ? var.web_acl_id   : null )
+  tags                            = merge({cloudfront_alias = var.cf_name},var.tags)
 
-  dynamic "logging_config" {
-    for_each = length(keys(var.logging_config)) == 0 ? [] : [var.logging_config]
-
-    content {
-      bucket          = logging_config.value["bucket"]
-      prefix          = lookup(logging_config.value, "prefix", null)
-      include_cookies = lookup(logging_config.value, "include_cookies", null)
-    }
-  }
+#  dynamic "logging_config" {
+#    for_each = length(keys(var.logging_config)) == 0 ? [] : [var.logging_config]
+#
+#    content {
+#      bucket          = logging_config.value["bucket"]
+#      prefix          = lookup(logging_config.value, "prefix", null)
+#      include_cookies = lookup(logging_config.value, "include_cookies", null)
+#    }
+#  }
 
   dynamic "origin" {
     for_each = var.origin
@@ -86,15 +52,6 @@ resource "aws_cloudfront_distribution" "this" {
       origin_path              = lookup(origin.value, "origin_path", "")
       connection_attempts      = lookup(origin.value, "connection_attempts", null)
       connection_timeout       = lookup(origin.value, "connection_timeout", null)
-      origin_access_control_id = lookup(origin.value, "origin_access_control_id", lookup(lookup(aws_cloudfront_origin_access_control.this, lookup(origin.value, "origin_access_control", ""), {}), "id", null))
-
-      dynamic "s3_origin_config" {
-        for_each = length(keys(lookup(origin.value, "s3_origin_config", {}))) == 0 ? [] : [lookup(origin.value, "s3_origin_config", {})]
-
-        content {
-          origin_access_identity = lookup(s3_origin_config.value, "cloudfront_access_identity_path", lookup(lookup(aws_cloudfront_origin_access_identity.this, lookup(s3_origin_config.value, "origin_access_identity", ""), {}), "cloudfront_access_identity_path", null))
-        }
-      }
 
       dynamic "custom_origin_config" {
         for_each = length(lookup(origin.value, "custom_origin_config", "")) == 0 ? [] : [lookup(origin.value, "custom_origin_config", "")]
@@ -119,21 +76,11 @@ resource "aws_cloudfront_distribution" "this" {
       }
 
       dynamic "origin_shield" {
-        for_each = lookup(lookup(origin.value, "origin_shield", {}), "enabled", false) ? [lookup(origin.value, "origin_shield", {})] : []
+        for_each = length(keys(lookup(origin.value, "origin_shield", {}))) == 0 ? [] : [lookup(origin.value, "origin_shield", {})]
 
         content {
           enabled              = origin_shield.value.enabled
           origin_shield_region = origin_shield.value.origin_shield_region
-        }
-      }
-
-      dynamic "vpc_origin_config" {
-        for_each = length(keys(lookup(origin.value, "vpc_origin_config", {}))) == 0 ? [] : [lookup(origin.value, "vpc_origin_config", {})]
-
-        content {
-          vpc_origin_id            = lookup(vpc_origin_config.value, "vpc_origin_id", lookup(lookup(aws_cloudfront_vpc_origin.this, lookup(vpc_origin_config.value, "vpc_origin", ""), {}), "id", null))
-          origin_keepalive_timeout = lookup(vpc_origin_config.value, "origin_keepalive_timeout", null)
-          origin_read_timeout      = lookup(vpc_origin_config.value, "origin_read_timeout", null)
         }
       }
     }
@@ -220,13 +167,6 @@ resource "aws_cloudfront_distribution" "this" {
           function_arn = f.value.function_arn
         }
       }
-
-      dynamic "grpc_config" {
-        for_each = try([i.value.grpc_config], [])
-        content {
-          enabled = grpc_config.value.enabled
-        }
-      }
     }
   }
 
@@ -292,13 +232,6 @@ resource "aws_cloudfront_distribution" "this" {
           function_arn = f.value.function_arn
         }
       }
-
-      dynamic "grpc_config" {
-        for_each = try([i.value.grpc_config], [])
-        content {
-          enabled = grpc_config.value.enabled
-        }
-      }
     }
   }
 
@@ -335,6 +268,36 @@ resource "aws_cloudfront_distribution" "this" {
   }
 }
 
+resource "aws_cloudwatch_log_delivery_source" "cloudfront_logs" {
+  count        = var.s3_logging.logging_retention > 0 ? 1 : 0
+  name         = "cloudwatch-access-logs-${var.s3_logging.logging_name_prefix}"
+  log_type     = var.s3_logging.log_type
+  resource_arn = aws_cloudfront_distribution.this[count.index].arn
+}
+
+resource "aws_cloudwatch_log_delivery_destination" "cloudfront_log_dest" {
+  count        = var.s3_logging.logging_retention > 0 ? 1 : 0
+  name = "cloudfront-destination-logs-${var.s3_logging.logging_name_prefix}"
+
+  output_format = var.s3_logging.output_format
+
+  delivery_destination_configuration {
+    destination_resource_arn = "arn:aws:s3:::${var.s3_logging.bucket}"
+
+  }
+}
+
+resource "aws_cloudwatch_log_delivery" "cloudfront_logs" {
+  count        = var.s3_logging.logging_retention > 0 ? 1 : 0
+  delivery_source_name     = aws_cloudwatch_log_delivery_source.cloudfront_logs[count.index].name
+  delivery_destination_arn = aws_cloudwatch_log_delivery_destination.cloudfront_log_dest[count.index].arn
+  s3_delivery_configuration {
+    enable_hive_compatible_path = var.s3_logging.enable_hive_compatible_path
+    suffix_path                 = var.s3_logging.logging_path
+  }
+
+}
+
 resource "aws_cloudfront_monitoring_subscription" "this" {
   count = var.create_distribution && var.create_monitoring_subscription ? 1 : 0
 
@@ -363,4 +326,17 @@ data "aws_cloudfront_response_headers_policy" "this" {
   for_each = toset([for v in concat([var.default_cache_behavior], var.ordered_cache_behavior) : v.response_headers_policy_name if can(v.response_headers_policy_name)])
 
   name = each.key
+}
+
+##########
+# R53
+##########
+resource aws_route53_record "dist_r53" {
+  for_each = var.create_r53_record ? toset(var.aliases) : []
+  allow_overwrite = true
+  zone_id = var.hosted_zone_id
+  name    = each.value
+  type    = "CNAME"
+  ttl     = "5"
+  records = [aws_cloudfront_distribution.this[0].domain_name]
 }
